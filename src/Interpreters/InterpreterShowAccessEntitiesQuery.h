@@ -6,24 +6,21 @@
 
 namespace DB
 {
-class Context;
 
-class InterpreterShowAccessEntitiesQuery : public IInterpreter
+class InterpreterShowAccessEntitiesQuery : public IInterpreter, WithMutableContext
 {
 public:
-    InterpreterShowAccessEntitiesQuery(const ASTPtr & query_ptr_, Context & context_);
+    InterpreterShowAccessEntitiesQuery(const ASTPtr & query_ptr_, ContextMutablePtr context_);
 
     BlockIO execute() override;
 
-    bool ignoreQuota() const override { return ignore_quota; }
-    bool ignoreLimits() const override { return ignore_quota; }
+    bool ignoreQuota() const override { return true; }
+    bool ignoreLimits() const override { return true; }
 
 private:
     String getRewrittenQuery() const;
 
     ASTPtr query_ptr;
-    Context & context;
-    bool ignore_quota = false;
 };
 
 }

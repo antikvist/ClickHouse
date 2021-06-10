@@ -1,12 +1,19 @@
 #pragma once
 
 #include <Storages/MergeTree/MergeTreePartInfo.h>
-#include <Core/Types.h>
+#include <common/types.h>
 #include <map>
+#include <vector>
 
+namespace Poco
+{
+class Logger;
+}
 
 namespace DB
 {
+
+using Strings = std::vector<String>;
 
 /** Supports multiple names of active parts of data.
   * Repeats part of the MergeTreeData functionality.
@@ -43,7 +50,7 @@ public:
 
     /// Returns true if the part was actually added. If out_replaced_parts != nullptr, it will contain
     /// parts that were replaced from the set by the newly added part.
-    bool add(const String & name, Strings * out_replaced_parts = nullptr);
+    bool add(const String & name, Strings * out_replaced_parts = nullptr, Poco::Logger * log = nullptr);
 
     bool remove(const MergeTreePartInfo & part_info)
     {
@@ -63,6 +70,18 @@ public:
         result &= remove(part_name);
         for (const auto & part : parts_covered_by)
             result &= remove(part);
+
+        return result;
+    }
+
+    /// Remove only covered parts from active set
+    bool removePartsCoveredBy(const String & part_name)
+    {
+        Strings parts_covered_by = getPartsCoveredBy(MergeTreePartInfo::fromPartName(part_name, format_version));
+        bool result = true;
+        for (const auto & part : parts_covered_by)
+            if (part != part_name)
+                result &= remove(part);
 
         return result;
     }

@@ -1,9 +1,10 @@
 #pragma once
 
-#include <Core/Types.h>
+#include <common/types.h>
 #include <Common/ZooKeeper/Types.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <common/logger_useful.h>
+#include <Common/randomSeed.h>
 #include <Core/BackgroundSchedulePool.h>
 #include <thread>
 
@@ -36,7 +37,7 @@ private:
     String log_name;
     Poco::Logger * log;
     BackgroundSchedulePool::TaskHolder task;
-    pcg64 rng;
+    pcg64 rng{randomSeed()};
 
     void run();
     void iterate();
@@ -57,8 +58,8 @@ private:
     /// Remove old mutations that are done from ZooKeeper. This is done by the leader replica.
     void clearOldMutations();
 
-    using NodeCTimeCache = std::map<String, Int64>;
-    NodeCTimeCache cached_block_stats;
+    using NodeCTimeAndVersionCache = std::map<String, std::pair<Int64, Int32>>;
+    NodeCTimeAndVersionCache cached_block_stats;
 
     struct NodeWithStat;
     /// Returns list of blocks (with their stat) sorted by ctime in descending order.

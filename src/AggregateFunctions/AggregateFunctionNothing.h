@@ -8,6 +8,7 @@
 
 namespace DB
 {
+struct Settings;
 
 
 /** Aggregate function that takes arbitrary number of arbitrary arguments and does nothing.
@@ -25,8 +26,10 @@ public:
 
     DataTypePtr getReturnType() const override
     {
-        return std::make_shared<DataTypeNullable>(std::make_shared<DataTypeNothing>());
+        return argument_types.front();
     }
+
+    bool allocatesMemoryInArena() const override { return false; }
 
     void create(AggregateDataPtr) const override
     {
@@ -67,7 +70,7 @@ public:
     {
     }
 
-    void insertResultInto(AggregateDataPtr, IColumn & to) const override
+    void insertResultInto(AggregateDataPtr, IColumn & to, Arena *) const override
     {
         to.insertDefault();
     }

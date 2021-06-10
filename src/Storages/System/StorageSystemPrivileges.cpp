@@ -9,7 +9,7 @@
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnNullable.h>
 #include <Interpreters/Context.h>
-#include <Parsers/ASTExtendedRoleSet.h>
+#include <Parsers/ASTRolesOrUsersSet.h>
 #include <Access/AccessControlManager.h>
 #include <Access/SettingsProfile.h>
 #include <Access/AccessFlags.h>
@@ -74,7 +74,7 @@ NamesAndTypesList StorageSystemPrivileges::getNamesAndTypes()
 }
 
 
-void StorageSystemPrivileges::fillData(MutableColumns & res_columns, const Context &, const SelectQueryInfo &) const
+void StorageSystemPrivileges::fillData(MutableColumns & res_columns, ContextPtr, const SelectQueryInfo &) const
 {
     size_t column_index = 0;
     auto & column_access_type = assert_cast<ColumnInt8 &>(*res_columns[column_index++]).getData();

@@ -4,6 +4,7 @@
 #include <Interpreters/Context.h>
 
 #include <random>
+#include <pcg_random.hpp>
 #include <unordered_set>
 
 
@@ -23,7 +24,7 @@ ReplicatedMergeTreeCleanupThread::ReplicatedMergeTreeCleanupThread(StorageReplic
     , log_name(storage.getStorageID().getFullTableName() + " (ReplicatedMergeTreeCleanupThread)")
     , log(&Poco::Logger::get(log_name))
 {
-    task = storage.global_context.getSchedulePool().createTask(log_name, [this]{ run(); });
+    task = storage.getContext()->getSchedulePool().createTask(log_name, [this]{ run(); });
 }
 
 void ReplicatedMergeTreeCleanupThread::run()
@@ -57,9 +58,10 @@ void ReplicatedMergeTreeCleanupThread::iterate()
     storage.clearOldPartsAndRemoveFromZK();
 
     {
-        /// TODO: Implement tryLockStructureForShare.
-        auto lock = storage.lockStructureForShare(
-                false, RWLockImpl::NO_QUERY, storage.getSettings()->lock_acquire_timeout_for_background_operations);
+        auto lock = storage.lockForShare(RWLockImpl::NO_QUERY, storage.getSettings()->lock_acquire_timeout_for_background_operations);
+        /// Both use relative_data_path which changes during rename, so we
+        /// do it under share lock
+        storage.clearOldWriteAheadLogs();
         storage.clearOldTemporaryDirectories();
     }
 
@@ -70,6 +72,7 @@ void ReplicatedMergeTreeCleanupThread::iterate()
         clearOldLogs();
         clearOldBlocks();
         clearOldMutations();
+        storage.clearEmptyParts();
     }
 }
 
@@ -85,8 +88,14 @@ void ReplicatedMergeTreeCleanupThread::clearOldLogs()
 
     int children_count = stat.numChildren;
 
-    /// We will wait for 1.1 times more records to accumulate than necessary.
-    if (static_cast<double>(children_count) < storage_settings->min_replicated_logs_to_keep * 1.1)
+    /// We will wait for 1.05 to 1.15 times more records to accumulate than necessary.
+    /// Randomization is needed to spread the time when multiple replicas come here.
+    /// Numbers are arbitrary.
+    std::uniform_real_distribution<double> distr(1.05, 1.15);
+    double ratio = distr(rng);
+    size_t min_replicated_logs_to_keep = storage_settings->min_replicated_logs_to_keep * ratio;
+
+    if (static_cast<double>(children_count) < min_replicated_logs_to_keep)
         return;
 
     Strings replicas = zookeeper->getChildren(storage.zookeeper_path + "/replicas", &stat);
@@ -214,10 +223,15 @@ void ReplicatedMergeTreeCleanupThread::clearOldLogs()
     if (entries.empty())
         return;
 
-    markLostReplicas(host_versions_lost_replicas, log_pointers_candidate_lost_replicas, replicas.size() - num_replicas_were_marked_is_lost, zookeeper);
+    markLostReplicas(
+        host_versions_lost_replicas,
+        log_pointers_candidate_lost_replicas,
+        replicas.size() - num_replicas_were_marked_is_lost,
+        zookeeper);
 
     Coordination::Requests ops;
-    for (size_t i = 0; i < entries.size(); ++i)
+    size_t i = 0;
+    for (; i < entries.size(); ++i)
     {
         ops.emplace_back(zkutil::makeRemoveRequest(storage.zookeeper_path + "/log/" + entries[i], -1));
 
@@ -229,12 +243,25 @@ void ReplicatedMergeTreeCleanupThread::clearOldLogs()
 
             /// Simultaneously with clearing the log, we check to see if replica was added since we received replicas list.
             ops.emplace_back(zkutil::makeCheckRequest(storage.zookeeper_path + "/replicas", stat.version));
-            zookeeper->multi(ops);
+
+            try
+            {
+                zookeeper->multi(ops);
+            }
+            catch (const zkutil::KeeperMultiException & e)
+            {
+                /// Another replica already deleted the same node concurrently.
+                if (e.code == Coordination::Error::ZNONODE)
+                    break;
+
+                throw;
+            }
             ops.clear();
         }
     }
 
-    LOG_DEBUG(log, "Removed {} old log entries: {} - {}", entries.size(), entries.front(), entries.back());
+    if (i != 0)
+        LOG_DEBUG(log, "Removed {} old log entries: {} - {}", i, entries[0], entries[i - 1]);
 }
 
 
@@ -248,10 +275,13 @@ void ReplicatedMergeTreeCleanupThread::markLostReplicas(const std::unordered_map
     for (const auto & pair : log_pointers_candidate_lost_replicas)
     {
         String replica = pair.first;
+        LOG_WARNING(log, "Will mark replica {} as lost, because it has stale log pointer: {}", replica, pair.second);
         Coordination::Requests ops;
         /// If host changed version we can not mark replicas, because replica started to be active.
-        ops.emplace_back(zkutil::makeCheckRequest(storage.zookeeper_path + "/replicas/" + replica + "/host", host_versions_lost_replicas.at(replica)));
-        ops.emplace_back(zkutil::makeSetRequest(storage.zookeeper_path + "/replicas/" + replica + "/is_lost", "1", -1));
+        ops.emplace_back(zkutil::makeCheckRequest(
+            storage.zookeeper_path + "/replicas/" + replica + "/host", host_versions_lost_replicas.at(replica)));
+        ops.emplace_back(zkutil::makeSetRequest(
+            storage.zookeeper_path + "/replicas/" + replica + "/is_lost", "1", -1));
         candidate_lost_replicas.push_back(replica);
         requests.push_back(ops);
     }
@@ -261,7 +291,7 @@ void ReplicatedMergeTreeCleanupThread::markLostReplicas(const std::unordered_map
 
     std::vector<zkutil::ZooKeeper::FutureMulti> futures;
     for (size_t i = 0; i < candidate_lost_replicas.size(); ++i)
-        futures.emplace_back(zookeeper->tryAsyncMulti(requests[i]));
+        futures.emplace_back(zookeeper->asyncTryMultiNoThrow(requests[i]));
 
     for (size_t i = 0; i < candidate_lost_replicas.size(); ++i)
     {
@@ -277,8 +307,9 @@ struct ReplicatedMergeTreeCleanupThread::NodeWithStat
 {
     String node;
     Int64 ctime = 0;
+    Int32 version = 0;
 
-    NodeWithStat(String node_, Int64 ctime_) : node(std::move(node_)), ctime(ctime_) {}
+    NodeWithStat(String node_, Int64 ctime_, Int32 version_) : node(std::move(node_)), ctime(ctime_), version(version_) {}
 
     static bool greaterByTime(const NodeWithStat & lhs, const NodeWithStat & rhs)
     {
@@ -299,21 +330,33 @@ void ReplicatedMergeTreeCleanupThread::clearOldBlocks()
 
     /// Use ZooKeeper's first node (last according to time) timestamp as "current" time.
     Int64 current_time = timed_blocks.front().ctime;
-    Int64 time_threshold = std::max(static_cast<Int64>(0), current_time - static_cast<Int64>(1000 * storage_settings->replicated_deduplication_window_seconds));
+    Int64 time_threshold = std::max(
+        static_cast<Int64>(0),
+        current_time - static_cast<Int64>(1000 * storage_settings->replicated_deduplication_window_seconds));
 
     /// Virtual node, all nodes that are "greater" than this one will be deleted
-    NodeWithStat block_threshold{{}, time_threshold};
+    NodeWithStat block_threshold{{}, time_threshold, 0};
 
     size_t current_deduplication_window = std::min<size_t>(timed_blocks.size(), storage_settings->replicated_deduplication_window);
     auto first_outdated_block_fixed_threshold = timed_blocks.begin() + current_deduplication_window;
-    auto first_outdated_block_time_threshold = std::upper_bound(timed_blocks.begin(), timed_blocks.end(), block_threshold, NodeWithStat::greaterByTime);
+    auto first_outdated_block_time_threshold = std::upper_bound(
+        timed_blocks.begin(), timed_blocks.end(), block_threshold, NodeWithStat::greaterByTime);
     auto first_outdated_block = std::min(first_outdated_block_fixed_threshold, first_outdated_block_time_threshold);
+
+    auto num_nodes_to_delete = timed_blocks.end() - first_outdated_block;
+    if (!num_nodes_to_delete)
+        return;
+
+    auto last_outdated_block = timed_blocks.end() - 1;
+    LOG_TRACE(log, "Will clear {} old blocks from {} (ctime {}) to {} (ctime {})", num_nodes_to_delete,
+              first_outdated_block->node, first_outdated_block->ctime,
+              last_outdated_block->node, last_outdated_block->ctime);
 
     zkutil::AsyncResponses<Coordination::RemoveResponse> try_remove_futures;
     for (auto it = first_outdated_block; it != timed_blocks.end(); ++it)
     {
         String path = storage.zookeeper_path + "/blocks/" + it->node;
-        try_remove_futures.emplace_back(path, zookeeper->asyncTryRemove(path));
+        try_remove_futures.emplace_back(path, zookeeper->asyncTryRemove(path, it->version));
     }
 
     for (auto & pair : try_remove_futures)
@@ -326,19 +369,20 @@ void ReplicatedMergeTreeCleanupThread::clearOldBlocks()
             zookeeper->removeRecursive(path);
             cached_block_stats.erase(first_outdated_block->node);
         }
-        else if (rc != Coordination::Error::ZOK)
-            LOG_WARNING(log, "Error while deleting ZooKeeper path `{}`: {}, ignoring.", path, Coordination::errorMessage(rc));
-        else
+        else if (rc == Coordination::Error::ZOK || rc == Coordination::Error::ZNONODE || rc == Coordination::Error::ZBADVERSION)
         {
+            /// No node is Ok. Another replica is removing nodes concurrently.
             /// Successfully removed blocks have to be removed from cache
             cached_block_stats.erase(first_outdated_block->node);
+        }
+        else
+        {
+            LOG_WARNING(log, "Error while deleting ZooKeeper path `{}`: {}, ignoring.", path, Coordination::errorMessage(rc));
         }
         first_outdated_block++;
     }
 
-    auto num_nodes_to_delete = timed_blocks.end() - first_outdated_block;
-    if (num_nodes_to_delete)
-        LOG_TRACE(log, "Cleared {} old blocks from ZooKeeper", num_nodes_to_delete);
+    LOG_TRACE(log, "Cleared {} old blocks from ZooKeeper", num_nodes_to_delete);
 }
 
 
@@ -383,7 +427,8 @@ void ReplicatedMergeTreeCleanupThread::getBlocksSortedByTime(zkutil::ZooKeeper &
         else
         {
             /// Cached block
-            timed_blocks.emplace_back(block, it->second);
+            const auto & ctime_and_version = it->second;
+            timed_blocks.emplace_back(block, ctime_and_version.first, ctime_and_version.second);
         }
     }
 
@@ -393,8 +438,8 @@ void ReplicatedMergeTreeCleanupThread::getBlocksSortedByTime(zkutil::ZooKeeper &
         auto status = elem.second.get();
         if (status.error != Coordination::Error::ZNONODE)
         {
-            cached_block_stats.emplace(elem.first, status.stat.ctime);
-            timed_blocks.emplace_back(elem.first, status.stat.ctime);
+            cached_block_stats.emplace(elem.first, std::make_pair(status.stat.ctime, status.stat.version));
+            timed_blocks.emplace_back(elem.first, status.stat.ctime, status.stat.version);
         }
     }
 
@@ -453,8 +498,20 @@ void ReplicatedMergeTreeCleanupThread::clearOldMutations()
         {
             /// Simultaneously with clearing the log, we check to see if replica was added since we received replicas list.
             ops.emplace_back(zkutil::makeCheckRequest(storage.zookeeper_path + "/replicas", replicas_stat.version));
-            zookeeper->multi(ops);
-            LOG_DEBUG(log, "Removed {} old mutation entries: {} - {}", (i + 1 - batch_start_i), entries[batch_start_i], entries[i]);
+            try
+            {
+                zookeeper->multi(ops);
+            }
+            catch (const zkutil::KeeperMultiException & e)
+            {
+                /// Another replica already deleted the same node concurrently.
+                if (e.code == Coordination::Error::ZNONODE)
+                    break;
+
+                throw;
+            }
+            LOG_DEBUG(log, "Removed {} old mutation entries: {} - {}",
+                i + 1 - batch_start_i, entries[batch_start_i], entries[i]);
             batch_start_i = i + 1;
             ops.clear();
         }

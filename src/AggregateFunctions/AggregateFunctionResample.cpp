@@ -6,12 +6,16 @@
 
 namespace DB
 {
+struct Settings;
 
 namespace ErrorCodes
 {
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 }
+
+namespace
+{
 
 class AggregateFunctionCombinatorResample final : public IAggregateFunctionCombinator
 {
@@ -43,12 +47,13 @@ public:
 
     AggregateFunctionPtr transformAggregateFunction(
         const AggregateFunctionPtr & nested_function,
+        const AggregateFunctionProperties &,
         const DataTypes & arguments,
         const Array & params) const override
     {
         WhichDataType which{arguments.back()};
 
-        if (which.isNativeUInt() || which.isDateOrDateTime())
+        if (which.isNativeUInt() || which.isDate() || which.isDateTime() || which.isDateTime64())
         {
             UInt64 begin = params[params.size() - 3].safeGet<UInt64>();
             UInt64 end = params[params.size() - 2].safeGet<UInt64>();
@@ -91,6 +96,8 @@ public:
             ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
     }
 };
+
+}
 
 void registerAggregateFunctionCombinatorResample(AggregateFunctionCombinatorFactory & factory)
 {

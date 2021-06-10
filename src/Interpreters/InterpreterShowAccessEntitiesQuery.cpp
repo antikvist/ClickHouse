@@ -17,24 +17,27 @@ namespace ErrorCodes
 using EntityType = IAccessEntity::Type;
 
 
-InterpreterShowAccessEntitiesQuery::InterpreterShowAccessEntitiesQuery(const ASTPtr & query_ptr_, Context & context_)
-    : query_ptr(query_ptr_), context(context_), ignore_quota(query_ptr->as<ASTShowAccessEntitiesQuery &>().type == EntityType::QUOTA)
+InterpreterShowAccessEntitiesQuery::InterpreterShowAccessEntitiesQuery(const ASTPtr & query_ptr_, ContextMutablePtr context_)
+    : WithMutableContext(context_), query_ptr(query_ptr_)
 {
 }
 
 
 BlockIO InterpreterShowAccessEntitiesQuery::execute()
 {
-    return executeQuery(getRewrittenQuery(), context, true);
+    return executeQuery(getRewrittenQuery(), getContext(), true);
 }
 
 
 String InterpreterShowAccessEntitiesQuery::getRewrittenQuery() const
 {
-    const auto & query = query_ptr->as<ASTShowAccessEntitiesQuery &>();
+    auto & query = query_ptr->as<ASTShowAccessEntitiesQuery &>();
+    query.replaceEmptyDatabase(getContext()->getCurrentDatabase());
+
     String origin;
     String expr = "*";
-    String filter, order;
+    String filter;
+    String order;
 
     switch (query.type)
     {
@@ -42,14 +45,20 @@ String InterpreterShowAccessEntitiesQuery::getRewrittenQuery() const
         {
             origin = "row_policies";
             expr = "name";
-            const String & table_name = query.table_name;
-            if (!table_name.empty())
+
+            if (!query.short_name.empty())
+                filter = "short_name = " + quoteString(query.short_name);
+
+            if (query.database_and_table_name)
             {
-                String database = query.database;
-                if (database.empty())
-                    database = context.getCurrentDatabase();
-                filter = "database = " + quoteString(database) + " AND table = " + quoteString(table_name);
-                expr = "short_name";
+                const String & database = query.database_and_table_name->first;
+                const String & table_name = query.database_and_table_name->second;
+                if (!database.empty())
+                    filter += String{filter.empty() ? "" : " AND "} + "database = " + quoteString(database);
+                if (!table_name.empty())
+                    filter += String{filter.empty() ? "" : " AND "} + "table = " + quoteString(table_name);
+                if (!database.empty() && !table_name.empty())
+                    expr = "short_name";
             }
             break;
         }

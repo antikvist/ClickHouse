@@ -6,12 +6,16 @@
 
 namespace DB
 {
+struct Settings;
 
 namespace ErrorCodes
 {
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 }
+
+namespace
+{
 
 class AggregateFunctionCombinatorMerge final : public IAggregateFunctionCombinator
 {
@@ -34,7 +38,10 @@ public:
     }
 
     AggregateFunctionPtr transformAggregateFunction(
-        const AggregateFunctionPtr & nested_function, const DataTypes & arguments, const Array &) const override
+        const AggregateFunctionPtr & nested_function,
+        const AggregateFunctionProperties &,
+        const DataTypes & arguments,
+        const Array &) const override
     {
         const DataTypePtr & argument = arguments[0];
 
@@ -51,6 +58,8 @@ public:
         return std::make_shared<AggregateFunctionMerge>(nested_function, argument);
     }
 };
+
+}
 
 void registerAggregateFunctionCombinatorMerge(AggregateFunctionCombinatorFactory & factory)
 {
